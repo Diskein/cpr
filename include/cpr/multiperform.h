@@ -4,6 +4,7 @@
 #include "cpr/curlmultiholder.h"
 #include "cpr/response.h"
 #include "cpr/session.h"
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <queue>
@@ -13,6 +14,7 @@
 namespace cpr {
 
 class InterceptorMulti;
+class AsyncMultiPerform;
 
 class MultiPerform {
   public:
@@ -47,6 +49,7 @@ class MultiPerform {
     std::vector<Response> Post();
 
     std::vector<Response> Perform();
+
     template <typename... DownloadArgTypes>
     std::vector<Response> PerformDownload(DownloadArgTypes... args);
 
@@ -60,6 +63,7 @@ class MultiPerform {
   private:
     // Interceptors should be able to call the private proceed() and PrepareDownloadSessions() functions
     friend InterceptorMulti;
+    friend AsyncMultiPerform;
 
     void SetHttpMethod(HttpMethod method);
 
@@ -136,6 +140,30 @@ std::vector<Response> MultiPerform::PerformDownload(DownloadArgTypes... args) {
     PrepareDownloadSessions<DownloadArgTypes...>(0, args...);
     return MakeDownloadRequest();
 }
+
+class AsyncMultiPerform {
+  public:
+    using HttpMethod = MultiPerform::HttpMethod;
+
+    explicit AsyncMultiPerform(MultiPerform&& multi);
+    AsyncMultiPerform(const AsyncMultiPerform&) = delete;
+    AsyncMultiPerform(AsyncMultiPerform&&) = delete;
+    AsyncMultiPerform& operator=(const AsyncMultiPerform&) = delete;
+    AsyncMultiPerform& operator=(AsyncMultiPerform&&) = delete;
+
+    ~AsyncMultiPerform();
+
+    void AddSession(std::shared_ptr<Session>& session, MultiPerform::HttpMethod method = HttpMethod::UNDEFINED);
+    void AsyncPerform();
+
+  private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::vector<std::pair<std::shared_ptr<Session>, HttpMethod>> sessions_;
+    std::future<void> worker_;
+    MultiPerform multi_;
+    std::atomic<bool> cancelled_{false};
+};
 
 } // namespace cpr
 

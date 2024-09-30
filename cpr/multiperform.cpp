@@ -7,6 +7,7 @@
 #include "cpr/session.h"
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <curl/curl.h>
 #include <curl/curlver.h>
@@ -15,13 +16,14 @@
 #include <iosfwd>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
 
 namespace cpr {
-
 MultiPerform::MultiPerform() : multicurl_(new CurlMultiHolder()) {
     current_interceptor_ = interceptors_.end();
     first_interceptor_ = interceptors_.end();
@@ -327,6 +329,7 @@ std::vector<Response> MultiPerform::Perform() {
     return MakeRequest();
 }
 
+
 std::vector<Response> MultiPerform::proceed() {
     // Check if this multiperform mixes download and non download requests
     if (!sessions_.empty()) {
@@ -373,5 +376,129 @@ void MultiPerform::AddInterceptor(const std::shared_ptr<InterceptorMulti>& pinte
     interceptors_.push_back(pinterceptor);
     first_interceptor_ = interceptors_.begin();
 }
+
+AsyncMultiPerform::AsyncMultiPerform(MultiPerform&& multi) : multi_(std::move(multi)) {}
+
+void AsyncMultiPerform::AddSession(std::shared_ptr<Session>& session, HttpMethod method) {
+    switch (method) {
+        case HttpMethod::GET_REQUEST:
+            session->PrepareGet();
+            break;
+        case HttpMethod::POST_REQUEST:
+            session->PreparePost();
+            break;
+        case HttpMethod::PUT_REQUEST:
+            session->PreparePut();
+            break;
+        case HttpMethod::DELETE_REQUEST:
+            session->PrepareDelete();
+            break;
+        case HttpMethod::PATCH_REQUEST:
+            session->PreparePatch();
+            break;
+        case HttpMethod::HEAD_REQUEST:
+            session->PrepareHead();
+            break;
+        case HttpMethod::OPTIONS_REQUEST:
+            session->PrepareOptions();
+            break;
+        default:
+            std::cerr << "PrepareSessions failed: Undefined HttpMethod or download without arguments!" << '\n';
+            return;
+    }
+
+    // Add session to sessions_
+    std::lock_guard lock(mutex_);
+    sessions_.emplace_back(session, method);
+
+    cv_.notify_all();
+    curl_multi_wakeup(multi_.multicurl_->handle);
+}
+
+void AsyncMultiPerform::AsyncPerform() {
+    if (worker_.valid()) {
+        return;
+    }
+
+    worker_ = std::async(std::launch::async, [this] {
+        int still_running{0};
+        auto& multicurl_ = multi_.multicurl_;
+        auto& servingSessions = multi_.sessions_;
+
+        do {
+            {
+                std::lock_guard lock(mutex_);
+                for (auto& s : sessions_) {
+                    multi_.AddSession(s.first, s.second);
+                }
+                sessions_.clear();
+            }
+
+            CURLMcode error_code = curl_multi_perform(multicurl_->handle, &still_running);
+            if (error_code) {
+                std::cerr << "curl_multi_perform() failed, code " << static_cast<int>(error_code) << '\n';
+                // break;
+            }
+
+            // const int timeout_ms{250};
+//             if (still_running) {
+// #if LIBCURL_VERSION_NUM >= 0x074200 // 7.66.0
+//                 error_code = curl_multi_poll(multicurl_->handle, nullptr, 0, timeout_ms, nullptr);
+//                 if (error_code) {
+//                     std::cerr << "curl_multi_poll() failed, code " << static_cast<int>(error_code) << '\n';
+// #else
+//                 error_code = curl_multi_wait(multicurl_->handle, nullptr, 0, timeout_ms, nullptr);
+//                 if (error_code) {
+//                     std::cerr << "curl_multi_wait() failed, code " << static_cast<int>(error_code) << '\n';
+// #endif
+//                 }
+//             }
+            int msgq = 0;
+            struct CURLMsg* info{nullptr};
+
+            do {
+                // Read info from multihandle
+                info = curl_multi_info_read(multicurl_->handle, &msgq);
+
+                if (info) {
+                    // Find current session
+                    auto it = std::find_if(servingSessions.begin(), servingSessions.end(), [&info](const std::pair<std::shared_ptr<Session>, HttpMethod>& pair) { return pair.first->curl_->handle == info->easy_handle; });
+                    if (it == sessions_.end()) {
+                        std::cerr << "Failed to find current session!" << '\n';
+                        break;
+                    }
+                    const std::shared_ptr<Session> current_session = (*it).first;
+
+                    if (!current_session->async_response_callback_) {
+                        std::cerr << "async_response_callback wasn't found in current session! Use SetAsyncCallback!" << '\n';
+                        continue;
+                    }
+
+                    // Add response object
+                    // NOLINTNEXTLINE (cppcoreguidelines-pro-type-union-access)
+                    current_session->async_response_callback_(current_session->Complete(info->data.result));
+
+                    multi_.RemoveSession(current_session);
+                }
+            } while (info);
+
+            // if (multi_.sessions_.size() == 0) {
+            //     std::unique_lock lock(mutex_);
+            //     cv_.wait(lock, [this]() { return !sessions_.empty() || cancelled_; });
+            //     still_running = static_cast<int>(sessions_.size());
+            // }
+
+        } while (still_running || !cancelled_);
+    });
+}
+
+AsyncMultiPerform::~AsyncMultiPerform() {
+    cancelled_ = true;
+    cv_.notify_all();
+    if (worker_.valid()) {
+        worker_.get();
+    }
+}
+
 
 } // namespace cpr

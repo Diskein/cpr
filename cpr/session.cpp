@@ -11,6 +11,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -1048,5 +1049,8 @@ void Session::SetCancellationParam(std::shared_ptr<std::atomic_bool> param) {
     curl_easy_setopt(curl_->handle, CURLOPT_XFERINFODATA, &cbs_->cancellationcb_);
 #endif
     curl_easy_setopt(curl_->handle, CURLOPT_NOPROGRESS, 0L);
+}
+void Session::SetAsyncCallback(std::function<void(Response)>&& cb) {
+    async_response_callback_ = std::move(cb);
 }
 } // namespace cpr

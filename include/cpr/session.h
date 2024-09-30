@@ -49,6 +49,7 @@ using AsyncResponse = AsyncWrapper<Response>;
 
 class Interceptor;
 class MultiPerform;
+class AsyncMultiPerform;
 
 class Session : public std::enable_shared_from_this<Session> {
   public:
@@ -226,10 +227,13 @@ class Session : public std::enable_shared_from_this<Session> {
 
     void AddInterceptor(const std::shared_ptr<Interceptor>& pinterceptor);
 
+    void SetAsyncCallback(std::function<void(Response)>&& cb);
+
   private:
     // Interceptors should be able to call the private proceed() function
     friend Interceptor;
     friend MultiPerform;
+    friend AsyncMultiPerform;
 
 
     bool chunkedTransferEncoding_{false};
@@ -295,6 +299,8 @@ class Session : public std::enable_shared_from_this<Session> {
      * Returns true in case content_ is of type cpr::Body or cpr::Payload.
      **/
     [[nodiscard]] bool hasBodyOrPayload() const;
+
+    std::function<void(Response)> async_response_callback_;
 };
 
 template <typename Then>
